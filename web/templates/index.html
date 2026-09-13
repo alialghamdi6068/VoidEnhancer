@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VoidEnhancer</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <main class="shell">
+    <section class="hero">
+      <p class="eyebrow">VOIDENHANCER</p>
+      <h1>Enhance your video.</h1>
+      <p class="sub">A from-scratch AI video enhancement pipeline. Upload a video and process it with the trained VoidEnhancer model.</p>
+    </section>
+
+    <section class="card">
+      <label class="drop" for="video">
+        <span class="drop-title">Choose a video</span>
+        <span class="drop-sub">MP4, MOV, MKV, WEBM or AVI · max 250 MB</span>
+        <input id="video" type="file" accept="video/*">
+      </label>
+      <button id="enhance" disabled>Enhance video</button>
+      <p id="status" class="status">Select a video to begin.</p>
+    </section>
+  </main>
+  <script>
+    const input = document.querySelector('#video');
+    const button = document.querySelector('#enhance');
+    const status = document.querySelector('#status');
+
+    input.addEventListener('change', () => {
+      button.disabled = !input.files.length;
+      status.textContent = input.files.length ? input.files[0].name : 'Select a video to begin.';
+    });
+
+    button.addEventListener('click', async () => {
+      if (!input.files.length) return;
+      button.disabled = true;
+      status.textContent = 'Processing… this can take a while on CPU.';
+      const form = new FormData();
+      form.append('file', input.files[0]);
+      try {
+        const response = await fetch('/api/enhance', { method: 'POST', body: form });
+        if (!response.ok) {
+          const data = await response.json().catch(() => ({}));
+          throw new Error(data.detail || 'Enhancement failed.');
+        }
+        const blob = await response.blob();
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = 'voidenhancer_4x.mp4';
+        link.textContent = 'Download enhanced video';
+        link.className = 'download';
+        document.querySelector('.card').appendChild(link);
+        status.textContent = 'Done.';
+      } catch (error) {
+        status.textContent = error.message;
+      } finally {
+        button.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
