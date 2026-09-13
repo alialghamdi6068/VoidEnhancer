@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Training data and generated model weights
+data/
+checkpoints/*.pt
+checkpoints/*.pth
+
+# Runtime uploads/outputs
+runtime/
+*.mp4
+*.mov
+*.mkv
+*.webm
