@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import argparse
-import random
 from pathlib import Path
 
 import torch
-from PIL import Image
 from torch.utils.data import DataLoader, Dataset
+from PIL import Image
 import torchvision.transforms.functional as TF
 
 from .losses import CharbonnierLoss, edge_loss
@@ -16,16 +15,14 @@ from .model import VoidEnhancer
 
 
 class PairedImageDataset(Dataset):
-    """Load matching LR/HR pairs and return aligned random patches."""
+    """Loads matching LR/HR images from data/train/lr and data/train/hr."""
 
-    def __init__(self, root: str, scale: int, patch_size: int = 128):
+    def __init__(self, root: str, patch_size: int = 192, scale: int = 4):
         self.root = Path(root)
-        self.scale = scale
-        self.patch_size = patch_size
         self.lr_dir = self.root / "lr"
         self.hr_dir = self.root / "hr"
-        if not self.lr_dir.exists() or not self.hr_dir.exists():
-            raise RuntimeError(f"Expected {self.lr_dir} and {self.hr_dir}")
+        self.patch_size = patch_size
+        self.scale = scale
         self.items = sorted(
             p for p in self.lr_dir.iterdir()
             if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
@@ -43,27 +40,17 @@ class PairedImageDataset(Dataset):
         lr = TF.to_tensor(Image.open(lr_path).convert("RGB"))
         hr = TF.to_tensor(Image.open(hr_path).convert("RGB"))
 
-        lr_h, lr_w = lr.shape[-2:]
-        expected_h, expected_w = lr_h * self.scale, lr_w * self.scale
-        if hr.shape[-2:] != (expected_h, expected_w):
-            raise ValueError(f"Pair {lr_path.name} has LR {lr.shape[-2:]} and HR {hr.shape[-2:]}; expected {expected_h, expected_w}")
+        expected_hr = (lr.shape[-2] * self.scale, lr.shape[-1] * self.scale)
+        if tuple(hr.shape[-2:]) != expected_hr:
+            raise ValueError(f"Pair {lr_path.name} has incompatible LR/HR dimensions.")
 
-        ps = min(self.patch_size, lr_h, lr_w)
-        if ps < 8:
-            raise ValueError(f"Image {lr_path.name} is too small for training.")
-        top = random.randint(0, lr_h - ps)
-        left = random.randint(0, lr_w - ps)
-        hr_top, hr_left = top * self.scale, left * self.scale
-        hr_ps = ps * self.scale
-        lr = lr[:, top:top + ps, left:left + ps]
-        hr = hr[:, hr_top:hr_top + hr_ps, hr_left:hr_left + hr_ps]
-
-        if random.random() < 0.5:
-            lr = torch.flip(lr, dims=[2])
-            hr = torch.flip(hr, dims=[2])
-        if random.random() < 0.5:
-            lr = torch.flip(lr, dims=[1])
-            hr = torch.flip(hr, dims=[1])
+        max_lr_h = min(lr.shape[-2], self.patch_size)
+        max_lr_w = min(lr.shape[-1], self.patch_size)
+        top = torch.randint(0, lr.shape[-2] - max_lr_h + 1, (1,)).item()
+        left = torch.randint(0, lr.shape[-1] - max_lr_w + 1, (1,)).item()
+        lr = lr[:, top:top + max_lr_h, left:left + max_lr_w]
+        hr = hr[:, top * self.scale:(top + max_lr_h) * self.scale,
+                left * self.scale:(left + max_lr_w) * self.scale]
         return lr, hr
 
 
@@ -71,24 +58,24 @@ def train(args: argparse.Namespace) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = VoidEnhancer(scale=args.scale).to(device)
     loader = DataLoader(
-        PairedImageDataset(args.data, args.scale, args.patch_size),
+        PairedImageDataset(args.data, args.patch_size, args.scale),
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.workers,
         pin_memory=device.type == "cuda",
-        persistent_workers=args.workers > 0,
     )
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    reconstruction = CharbonnierLoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    pixel_loss = CharbonnierLoss()
+    best_loss = float("inf")
     model.train()
 
     for epoch in range(1, args.epochs + 1):
         running = 0.0
         for lr, hr in loader:
-            lr, hr = lr.to(device, non_blocking=True), hr.to(device, non_blocking=True)
+            lr, hr = lr.to(device), hr.to(device)
             pred = model(lr)
-            loss = reconstruction(pred, hr) + args.edge_weight * edge_loss(pred, hr)
+            loss = pixel_loss(pred, hr) + args.edge_weight * edge_loss(pred, hr)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -97,9 +84,18 @@ def train(args: argparse.Namespace) -> None:
 
         average = running / len(loader)
         print(f"epoch={epoch} loss={average:.6f} device={device}")
-        if epoch % args.save_every == 0 or epoch == args.epochs:
+        if average < best_loss or epoch % args.save_every == 0:
+            best_loss = min(best_loss, average)
             Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-            torch.save({"model": model.state_dict(), "scale": args.scale, "epoch": epoch}, args.output)
+            torch.save(
+                {
+                    "model": model.state_dict(),
+                    "scale": args.scale,
+                    "epoch": epoch,
+                    "loss": average,
+                },
+                args.output,
+            )
 
 
 def main() -> None:
@@ -107,13 +103,13 @@ def main() -> None:
     parser.add_argument("--data", default="data/train")
     parser.add_argument("--output", default="checkpoints/voidenhancer.pt")
     parser.add_argument("--scale", type=int, choices=(2, 4), default=4)
-    parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--patch-size", type=int, default=128)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--patch-size", type=int, default=192)
     parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--edge-weight", type=float, default=0.1)
+    parser.add_argument("--edge-weight", type=float, default=0.05)
     parser.add_argument("--workers", type=int, default=2)
-    parser.add_argument("--save-every", type=int, default=1)
+    parser.add_argument("--save-every", type=int, default=5)
     args = parser.parse_args()
     train(args)
 
