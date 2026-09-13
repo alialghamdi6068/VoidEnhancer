@@ -4,3 +4,6 @@ Pillow>=11,<12
 numpy>=2,<3
 tqdm>=4.67,<5
 opencv-python-headless>=4.10,<5
+fastapi>=0.115,<1
+uvicorn[standard]>=0.34,<1
+python-multipart>=0.0.20,<1
