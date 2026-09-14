@@ -8,59 +8,113 @@
 </head>
 <body>
   <main class="shell">
-    <section class="hero">
-      <p class="eyebrow">VOIDENHANCER</p>
-      <h1>Enhance your video.</h1>
-      <p class="sub">A from-scratch AI video enhancement pipeline. Upload a video and process it with the trained VoidEnhancer model.</p>
-    </section>
+    <header class="hero">
+      <div class="brand">VOID<span>ENHANCER</span></div>
+      <h1>Make every frame clearer.</h1>
+      <p>AI-powered video enhancement with resolution recovery, cleanup and optional frame interpolation.</p>
+    </header>
 
     <section class="card">
-      <label class="drop" for="video">
-        <span class="drop-title">Choose a video</span>
-        <span class="drop-sub">MP4, MOV, MKV, WEBM or AVI · max 250 MB</span>
-        <input id="video" type="file" accept="video/*">
-      </label>
-      <button id="enhance" disabled>Enhance video</button>
-      <p id="status" class="status">Select a video to begin.</p>
+      <div class="tabs">
+        <button class="tab active" data-tab="upload">Upload video</button>
+        <button class="tab" data-tab="url">Video URL</button>
+      </div>
+
+      <div id="upload-panel" class="panel active">
+        <label class="drop" for="video">
+          <span class="drop-title">Choose a video</span>
+          <span class="drop-sub">MP4, MOV, MKV, WEBM, AVI or M4V · up to 8 GB</span>
+          <input id="video" type="file" accept="video/*">
+        </label>
+        <div id="file-name" class="selection">No video selected</div>
+      </div>
+
+      <div id="url-panel" class="panel">
+        <input id="video-url" class="url-input" type="url" placeholder="https://example.com/video" autocomplete="off">
+        <p class="hint">Use a direct/public video URL supported by the server downloader.</p>
+      </div>
+
+      <div class="settings">
+        <label>Output quality
+          <select id="scale"><option value="2">2×</option><option value="4" selected>4×</option></select>
+        </label>
+        <label><input id="denoise" type="checkbox" checked> Denoise</label>
+        <label><input id="deblock" type="checkbox" checked> Compression cleanup</label>
+        <label><input id="sharpen" type="checkbox" checked> Smart sharpen</label>
+        <label><input id="color" type="checkbox" checked> Color recovery</label>
+      </div>
+
+      <button id="enhance" class="primary">Enhance video</button>
+      <div id="progress-wrap" class="progress-wrap hidden">
+        <div class="progress-head"><span id="status">Preparing…</span><span id="percent">0%</span></div>
+        <div class="progress"><div id="bar"></div></div>
+      </div>
+      <a id="download" class="download hidden" href="#">Download enhanced video</a>
     </section>
   </main>
-  <script>
-    const input = document.querySelector('#video');
-    const button = document.querySelector('#enhance');
-    const status = document.querySelector('#status');
 
-    input.addEventListener('change', () => {
-      button.disabled = !input.files.length;
-      status.textContent = input.files.length ? input.files[0].name : 'Select a video to begin.';
-    });
+<script>
+const $ = id => document.getElementById(id);
+let mode = 'upload';
+let timer = null;
 
-    button.addEventListener('click', async () => {
-      if (!input.files.length) return;
-      button.disabled = true;
-      status.textContent = 'Processing… this can take a while on CPU.';
-      const form = new FormData();
-      form.append('file', input.files[0]);
-      try {
-        const response = await fetch('/api/enhance', { method: 'POST', body: form });
-        if (!response.ok) {
-          const data = await response.json().catch(() => ({}));
-          throw new Error(data.detail || 'Enhancement failed.');
-        }
-        const blob = await response.blob();
-        const url = URL.createObjectURL(blob);
-        const link = document.createElement('a');
-        link.href = url;
-        link.download = 'voidenhancer_4x.mp4';
-        link.textContent = 'Download enhanced video';
-        link.className = 'download';
-        document.querySelector('.card').appendChild(link);
-        status.textContent = 'Done.';
-      } catch (error) {
-        status.textContent = error.message;
-      } finally {
-        button.disabled = false;
-      }
-    });
-  </script>
+document.querySelectorAll('.tab').forEach(tab => tab.addEventListener('click', () => {
+  mode = tab.dataset.tab;
+  document.querySelectorAll('.tab').forEach(x => x.classList.toggle('active', x === tab));
+  $('upload-panel').classList.toggle('active', mode === 'upload');
+  $('url-panel').classList.toggle('active', mode === 'url');
+}));
+
+$('video').addEventListener('change', () => {
+  $('file-name').textContent = $('video').files[0]?.name || 'No video selected';
+});
+
+async function watch(jobId) {
+  clearTimeout(timer);
+  const response = await fetch(`/api/jobs/${jobId}`);
+  const job = await response.json();
+  if (!response.ok) throw new Error(job.detail || 'Job not found.');
+  $('progress-wrap').classList.remove('hidden');
+  $('bar').style.width = `${job.progress || 0}%`;
+  $('percent').textContent = `${job.progress || 0}%`;
+  $('status').textContent = job.message || job.status;
+  if (job.status === 'completed') {
+    $('download').href = job.download_url;
+    $('download').classList.remove('hidden');
+    $('enhance').disabled = false;
+    return;
+  }
+  if (job.status === 'failed') throw new Error(job.message || 'Enhancement failed.');
+  timer = setTimeout(() => watch(jobId).catch(showError), 1500);
+}
+
+function showError(error) {
+  $('status').textContent = error.message || 'Something went wrong.';
+  $('enhance').disabled = false;
+}
+
+$('enhance').addEventListener('click', async () => {
+  $('enhance').disabled = true;
+  $('download').classList.add('hidden');
+  $('progress-wrap').classList.remove('hidden');
+  $('status').textContent = 'Uploading…'; $('percent').textContent = '0%'; $('bar').style.width = '0%';
+  try {
+    let response;
+    const scale = $('scale').value;
+    if (mode === 'upload') {
+      if (!$('video').files.length) throw new Error('Choose a video first.');
+      const form = new FormData(); form.append('file', $('video').files[0]);
+      response = await fetch(`/api/enhance?scale=${scale}`, {method:'POST', body:form});
+    } else {
+      const url = $('video-url').value.trim();
+      if (!url) throw new Error('Enter a video URL first.');
+      response = await fetch('/api/enhance/url', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({url, scale:Number(scale)})});
+    }
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.detail || 'Could not create the job.');
+    await watch(data.job_id);
+  } catch (error) { showError(error); }
+});
+</script>
 </body>
 </html>
