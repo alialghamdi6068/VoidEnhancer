@@ -21,15 +21,32 @@ Progress = Callable[[int, int], None]
 
 
 def _mux_audio(video_only: Path, source: Path, output: Path) -> None:
+    """Create a browser-friendly MP4 while retaining the source audio when possible."""
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         video_only.replace(output)
         return
-    command = [ffmpeg, "-y", "-i", str(video_only), "-i", str(source),
-               "-map", "0:v:0", "-map", "1:a:0?", "-c:v", "copy", "-c:a", "aac",
-               "-b:a", "192k", "-shortest", str(output)]
+
+    command = [
+        ffmpeg, "-y",
+        "-i", str(video_only),
+        "-i", str(source),
+        "-map", "0:v:0",
+        "-map", "1:a:0?",
+        "-c:v", "libx264",
+        "-preset", "medium",
+        "-crf", "18",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-movflags", "+faststart",
+        "-shortest",
+        str(output),
+    ]
     result = subprocess.run(command, capture_output=True, text=True, timeout=1800)
     if result.returncode != 0:
+        # If the final encode fails, preserve the already-rendered video rather
+        # than losing the completed job. Audio can be absent in this fallback.
         video_only.replace(output)
 
 
