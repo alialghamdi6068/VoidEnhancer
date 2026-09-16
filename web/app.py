@@ -1,16 +1,21 @@
 """VoidEnhancer web API.
 
-Jobs run in a small background worker so long videos do not block the HTTP
-request. The AI pipeline stays in voidenhancer.video.
+Uploads and URL downloads are processed by a background worker. The worker
+streams video frames instead of loading an entire video into memory.
 """
 from __future__ import annotations
 
+import ipaddress
+import os
 import shutil
+import socket
 import subprocess
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Lock
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
@@ -27,8 +32,9 @@ WORK_DIR = ROOT / "runtime" / "jobs"
 WORK_DIR.mkdir(parents=True, exist_ok=True)
 
 ALLOWED = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
-MAX_UPLOAD_BYTES = 8 * 1024 * 1024 * 1024
-MAX_URL_BYTES = 8 * 1024 * 1024 * 1024
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_GB", "8")) * 1024 * 1024 * 1024
+MAX_URL_BYTES = MAX_UPLOAD_BYTES
+JOB_RETENTION_SECONDS = int(os.getenv("JOB_RETENTION_HOURS", "24")) * 3600
 executor = ThreadPoolExecutor(max_workers=1)
 jobs: dict[str, dict] = {}
 jobs_lock = Lock()
@@ -37,9 +43,16 @@ app = FastAPI(title="VoidEnhancer")
 app.mount("/static", StaticFiles(directory=str(WEB_DIR / "static")), name="static")
 
 
-class UrlRequest(BaseModel):
-    url: str = Field(min_length=8, max_length=2048)
+class EnhancementRequest(BaseModel):
     scale: int = Field(default=4, ge=2, le=4)
+    denoise: bool = True
+    deblock: bool = True
+    sharpen: bool = True
+    color: bool = True
+
+
+class UrlRequest(EnhancementRequest):
+    url: str = Field(min_length=8, max_length=2048)
 
 
 def set_job(job_id: str, **values) -> None:
@@ -47,10 +60,47 @@ def set_job(job_id: str, **values) -> None:
         jobs.setdefault(job_id, {}).update(values)
 
 
-def run_job(job_id: str, input_path: Path, output_path: Path, scale: int) -> None:
+def cleanup_old_jobs() -> None:
+    cutoff = time.time() - JOB_RETENTION_SECONDS
+    for job_dir in WORK_DIR.iterdir():
+        if not job_dir.is_dir():
+            continue
+        try:
+            if job_dir.stat().st_mtime < cutoff:
+                shutil.rmtree(job_dir, ignore_errors=True)
+                with jobs_lock:
+                    for job_id, job in list(jobs.items()):
+                        if Path(job.get("output", "")).parent == job_dir:
+                            jobs.pop(job_id, None)
+        except OSError:
+            continue
+
+
+def validate_public_url(value: str) -> None:
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise HTTPException(status_code=400, detail="Only HTTP(S) video URLs are supported.")
+    hostname = parsed.hostname
+    try:
+        addresses = {item[4][0] for item in socket.getaddrinfo(hostname, None)}
+    except socket.gaierror as exc:
+        raise HTTPException(status_code=400, detail="The video URL host could not be resolved.") from exc
+    for address in addresses:
+        ip = ipaddress.ip_address(address)
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified:
+            raise HTTPException(status_code=400, detail="Private or local video URLs are not allowed.")
+
+
+def run_job(job_id: str, input_path: Path, output_path: Path, settings: EnhancementRequest) -> None:
     try:
         set_job(job_id, status="processing", progress=0, message="Enhancing video")
-        options = EnhancementOptions(scale=scale)
+        options = EnhancementOptions(
+            scale=settings.scale,
+            denoise=settings.denoise,
+            deblock=settings.deblock,
+            sharpen=settings.sharpen,
+            color=settings.color,
+        )
         total = 0
 
         def progress(done: int, count: int) -> None:
@@ -59,8 +109,15 @@ def run_job(job_id: str, input_path: Path, output_path: Path, scale: int) -> Non
             value = round(done * 100 / count) if count else 0
             set_job(job_id, progress=min(100, value), message=f"Processing frame {done}" if count else "Processing video")
 
-        enhance_video(str(CHECKPOINT), str(input_path), str(output_path), scale=scale,
-                      device_name="auto", options=options, progress=progress)
+        enhance_video(
+            str(CHECKPOINT),
+            str(input_path),
+            str(output_path),
+            scale=settings.scale,
+            device_name="auto",
+            options=options,
+            progress=progress,
+        )
         set_job(job_id, status="completed", progress=100, message="Complete", total_frames=total)
     except Exception as exc:
         set_job(job_id, status="failed", progress=0, message=str(exc))
@@ -68,13 +125,26 @@ def run_job(job_id: str, input_path: Path, output_path: Path, scale: int) -> Non
         input_path.unlink(missing_ok=True)
 
 
-def submit_job(input_path: Path, scale: int) -> str:
+def submit_job(input_path: Path, settings: EnhancementRequest) -> str:
     job_id = uuid.uuid4().hex
     job_dir = input_path.parent
-    output_path = job_dir / f"voidenhancer_{scale}x.mp4"
-    set_job(job_id, status="queued", progress=0, message="Waiting for worker", output=str(output_path), scale=scale)
-    executor.submit(run_job, job_id, input_path, output_path, scale)
+    output_path = job_dir / f"voidenhancer_{settings.scale}x.mp4"
+    set_job(
+        job_id,
+        status="queued",
+        progress=0,
+        message="Waiting for worker",
+        output=str(output_path),
+        scale=settings.scale,
+        created_at=time.time(),
+    )
+    executor.submit(run_job, job_id, input_path, output_path, settings)
     return job_id
+
+
+@app.on_event("startup")
+def startup_cleanup() -> None:
+    cleanup_old_jobs()
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -88,11 +158,17 @@ def health() -> dict:
 
 
 @app.post("/api/enhance")
-async def enhance(file: UploadFile = File(...), scale: int = 4) -> dict:
+async def enhance(
+    file: UploadFile = File(...),
+    scale: int = 4,
+    denoise: bool = True,
+    deblock: bool = True,
+    sharpen: bool = True,
+    color: bool = True,
+) -> dict:
     if not CHECKPOINT.exists():
         raise HTTPException(status_code=503, detail="AI checkpoint is not available on this server yet.")
-    if scale not in (2, 4):
-        raise HTTPException(status_code=400, detail="Scale must be 2 or 4.")
+    settings = EnhancementRequest(scale=scale, denoise=denoise, deblock=deblock, sharpen=sharpen, color=color)
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in ALLOWED:
         raise HTTPException(status_code=400, detail="Unsupported video format.")
@@ -105,9 +181,9 @@ async def enhance(file: UploadFile = File(...), scale: int = 4) -> dict:
             while chunk := await file.read(1024 * 1024):
                 size += len(chunk)
                 if size > MAX_UPLOAD_BYTES:
-                    raise HTTPException(status_code=413, detail="Video is larger than 8 GB.")
+                    raise HTTPException(status_code=413, detail=f"Video is larger than {MAX_UPLOAD_BYTES // (1024**3)} GB.")
                 destination.write(chunk)
-        job_id = submit_job(input_path, scale)
+        job_id = submit_job(input_path, settings)
         return {"job_id": job_id, "status": "queued"}
     except HTTPException:
         shutil.rmtree(job_dir, ignore_errors=True)
@@ -115,20 +191,29 @@ async def enhance(file: UploadFile = File(...), scale: int = 4) -> dict:
     except Exception as exc:
         shutil.rmtree(job_dir, ignore_errors=True)
         raise HTTPException(status_code=500, detail=f"Could not create job: {exc}") from exc
+    finally:
+        await file.close()
 
 
 @app.post("/api/enhance/url")
 def enhance_url(request: UrlRequest) -> dict:
     if not CHECKPOINT.exists():
         raise HTTPException(status_code=503, detail="AI checkpoint is not available on this server yet.")
-    if not request.url.lower().startswith(("http://", "https://")):
-        raise HTTPException(status_code=400, detail="Only HTTP(S) video URLs are supported.")
+    validate_public_url(request.url)
     job_dir = WORK_DIR / uuid.uuid4().hex
     job_dir.mkdir(parents=True, exist_ok=True)
     source = job_dir / "source.%(ext)s"
     try:
-        command = ["yt-dlp", "--no-playlist", "--max-filesize", str(MAX_URL_BYTES),
-                   "-f", "bv*+ba/b", "--merge-output-format", "mp4", "-o", str(source), request.url]
+        command = [
+            "yt-dlp",
+            "--no-playlist",
+            "--max-filesize", str(MAX_URL_BYTES),
+            "--max-downloads", "1",
+            "-f", "bv*+ba/b",
+            "--merge-output-format", "mp4",
+            "-o", str(source),
+            request.url,
+        ]
         result = subprocess.run(command, capture_output=True, text=True, timeout=1800)
         if result.returncode != 0:
             shutil.rmtree(job_dir, ignore_errors=True)
@@ -137,7 +222,7 @@ def enhance_url(request: UrlRequest) -> dict:
         if not candidates:
             shutil.rmtree(job_dir, ignore_errors=True)
             raise HTTPException(status_code=400, detail="The URL did not produce a supported video file.")
-        job_id = submit_job(candidates[0], request.scale)
+        job_id = submit_job(candidates[0], request)
         return {"job_id": job_id, "status": "queued"}
     except subprocess.TimeoutExpired as exc:
         shutil.rmtree(job_dir, ignore_errors=True)
@@ -146,6 +231,7 @@ def enhance_url(request: UrlRequest) -> dict:
 
 @app.get("/api/jobs/{job_id}")
 def job_status(job_id: str) -> dict:
+    cleanup_old_jobs()
     with jobs_lock:
         job = jobs.get(job_id)
     if not job:
