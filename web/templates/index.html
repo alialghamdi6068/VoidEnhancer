@@ -31,7 +31,7 @@
 
       <div id="url-panel" class="panel">
         <input id="video-url" class="url-input" type="url" placeholder="https://example.com/video" autocomplete="off">
-        <p class="hint">Use a direct/public video URL supported by the server downloader.</p>
+        <p class="hint">Use a public video URL supported by the server downloader.</p>
       </div>
 
       <div class="settings">
@@ -93,6 +93,15 @@ function showError(error) {
   $('enhance').disabled = false;
 }
 
+function settings() {
+  return {
+    denoise: $('denoise').checked,
+    deblock: $('deblock').checked,
+    sharpen: $('sharpen').checked,
+    color: $('color').checked,
+  };
+}
+
 $('enhance').addEventListener('click', async () => {
   $('enhance').disabled = true;
   $('download').classList.add('hidden');
@@ -100,15 +109,21 @@ $('enhance').addEventListener('click', async () => {
   $('status').textContent = 'Uploading…'; $('percent').textContent = '0%'; $('bar').style.width = '0%';
   try {
     let response;
-    const scale = $('scale').value;
+    const scale = Number($('scale').value);
+    const options = settings();
     if (mode === 'upload') {
       if (!$('video').files.length) throw new Error('Choose a video first.');
-      const form = new FormData(); form.append('file', $('video').files[0]);
-      response = await fetch(`/api/enhance?scale=${scale}`, {method:'POST', body:form});
+      const form = new FormData();
+      form.append('file', $('video').files[0]);
+      response = await fetch(`/api/enhance?scale=${scale}&denoise=${options.denoise}&deblock=${options.deblock}&sharpen=${options.sharpen}&color=${options.color}`, {method:'POST', body:form});
     } else {
       const url = $('video-url').value.trim();
       if (!url) throw new Error('Enter a video URL first.');
-      response = await fetch('/api/enhance/url', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({url, scale:Number(scale)})});
+      response = await fetch('/api/enhance/url', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({url, scale, ...options})
+      });
     }
     const data = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(data.detail || 'Could not create the job.');
